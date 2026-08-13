@@ -4,8 +4,20 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime
 from dotenv import load_dotenv
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("pipeline.log", encoding="utf-8"),
+        logging.StreamHandler()  # i dalje ispisuje u konzolu, ne samo u fajl
+    ]
+)
+logger = logging.getLogger(__name__)
 
 API_KEY = os.getenv("COINGECKO_API_KEY")
 CONNECTION_STRING = os.getenv("SQL_CONNECTION_STRING")
@@ -13,6 +25,9 @@ API_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
 engine = create_engine(f"mssql+pyodbc:///?odbc_connect={CONNECTION_STRING}")
 
+class ServerError(Exception):
+    """Baca se za 5xx server greske - one se ponavljaju, za razliku od 4xx gresaka."""
+    pass
 
 def start_pipeline_run(conn):
     """Upisuje novi red u PipelineRunLog i vraća BatchId za praćenje."""
@@ -44,17 +59,23 @@ def finish_pipeline_run(conn, batch_id, status, rows_inserted=None, error_messag
     conn.commit()
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout, ServerError)),
+    reraise=True
+)
 def fetch_market_data():
-    """Poziva CoinGecko API i vraća listu coin-ova."""
+    logger.info("Pozivam CoinGecko API...")
     headers = {"x-cg-demo-api-key": API_KEY}
-    params = {
-        "vs_currency": "usd",
-        "order": "market_cap_desc",
-        "per_page": 100,
-        "page": 1
-    }
+    params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 100, "page": 1}
     response = requests.get(API_URL, headers=headers, params=params, timeout=10)
-    response.raise_for_status()  # baca grešku ako status nije 200
+
+    if 500 <= response.status_code < 600:
+        raise ServerError(f"Server greška {response.status_code}")
+    response.raise_for_status()  # baca za 4xx, ali tenacity to više ne hvata jer nije u retry listi
+
+    logger.info(f"API odgovorio uspešno, dobijeno {len(response.json())} coin-ova.")
     return response.json()
 
 
@@ -118,15 +139,16 @@ def run_pipeline():
     """Glavna orkestracija - poziva sve funkcije redom, hvata greške."""
     with engine.connect() as conn:
         batch_id = start_pipeline_run(conn)
+        logger.info(f"Pipeline pokrenut. Batch ID: {batch_id}")
         try:
             coins = fetch_market_data()
             upsert_dim_coin(conn, coins)
             rows = insert_fact_data(conn, coins, batch_id)
             finish_pipeline_run(conn, batch_id, "Success", rows_inserted=rows)
-            print(f"Pipeline uspešan. Batch {batch_id}, upisano {rows} redova.")
+            logger.info(f"Pipeline uspešan. Batch {batch_id}, upisano {rows} redova.")
         except Exception as e:
             finish_pipeline_run(conn, batch_id, "Failed", error_message=str(e))
-            print(f"Pipeline pao. Batch {batch_id}, greška: {e}")
+            logger.error(f"Pipeline pao. Batch {batch_id}, greška: {e}", exc_info=True)
             raise
 
 
